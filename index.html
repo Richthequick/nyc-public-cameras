@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NYC Public Cameras</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --card: #1a2332;
+    --accent: #3b82f6;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 16px;
+    line-height: 1.5;
+  }
+  .container { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 1.75rem; margin-bottom: 0.5rem; }
+  .subtitle { color: var(--muted); margin-bottom: 1.5rem; }
+  .search-box {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  input[type="text"] {
+    flex: 1;
+    min-width: 200px;
+    padding: 12px 16px;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    background: #0f172a;
+    color: var(--text);
+    font-size: 1rem;
+  }
+  button {
+    padding: 12px 20px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 1rem;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  button:hover { background: #2563eb; }
+  button.secondary { background: #334155; }
+  .status { margin: 12px 0; color: var(--muted); min-height: 1.5em; }
+  .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .cam-card {
+    background: var(--card);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #334155;
+  }
+  .cam-card img {
+    width: 100%;
+    height: 200px;
+    object-fit: cover;
+    background: #0f172a;
+    display: block;
+  }
+  .cam-info { padding: 12px 14px; }
+  .cam-name { font-weight: 600; margin-bottom: 4px; }
+  .cam-meta { font-size: 0.875rem; color: var(--muted); }
+  .distance { color: #60a5fa; font-weight: 600; }
+  .radius-info { background: #1e293b; padding: 8px 12px; border-radius: 8px; margin: 12px 0; font-size: 0.9rem; }
+  footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: center; }
+  .loading { opacity: 0.6; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>NYC Public Cameras</h1>
+  <p class="subtitle">Find publicly available traffic cameras near any address in New York City. Real-time still images from NYC DOT / TMC. Automatically expands search radius.</p>
+
+  <div class="search-box">
+    <input type="text" id="address" placeholder="Enter address or place in NYC (e.g. Times Square, 1 World Trade Center)" value="Times Square, New York">
+    <button id="searchBtn">Search</button>
+    <button id="locateBtn" class="secondary">Use My Location</button>
+  </div>
+  <div id="status" class="status"></div>
+  <div id="radiusInfo" class="radius-info" style="display:none;"></div>
+  <div id="results" class="results"></div>
+
+  <footer>
+    Data from NYC Traffic Management Center (webcams.nyctmc.org). Images update frequently. Not all locations have nearby cameras; search expands automatically. For best results start in Manhattan. Public cameras only — no private feeds.
+  </footer>
+</div>
+
+<script>
+const statusEl = document.getElementById('status');
+const resultsEl = document.getElementById('results');
+const radiusInfoEl = document.getElementById('radiusInfo');
+const addressInput = document.getElementById('address');
+
+let allCameras = [];
+let currentCenter = null;
+
+async function loadCameras() {
+  if (allCameras.length) return allCameras;
+  statusEl.textContent = 'Loading camera list...';
+  const res = await fetch('https://webcams.nyctmc.org/api/cameras');
+  if (!res.ok) throw new Error('Failed to load cameras');
+  allCameras = await res.json();
+  // Filter to online and valid coords
+  allCameras = allCameras.filter(c => c.isOnline === 'true' && c.latitude && c.longitude);
+  return allCameras;
+}
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 3958.8; // miles
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+async function geocode(query) {
+  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query + ', New York City')}&limit=1`;
+  const res = await fetch(url, { headers: { 'User-Agent': 'NYCCamerasApp/1.0' } });
+  const data = await res.json();
+  if (!data.length) throw new Error('Address not found');
+  return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), name: data[0].display_name };
+}
+
+function findNearby(centerLat, centerLon, minResults = 5) {
+  const radii = [0.3, 0.5, 1, 2, 5, 10]; // miles
+  for (const radius of radii) {
+    const nearby = allCameras
+      .map(cam => ({
+        ...cam,
+        distance: haversine(centerLat, centerLon, cam.latitude, cam.longitude)
+      }))
+      .filter(cam => cam.distance <= radius)
+      .sort((a, b) => a.distance - b.distance);
+    if (nearby.length >= minResults || radius === radii[radii.length - 1]) {
+      return { cameras: nearby.slice(0, 20), radiusUsed: radius, totalInRadius: nearby.length };
+    }
+  }
+  return { cameras: [], radiusUsed: 10, totalInRadius: 0 };
+}
+
+function renderCameras(cameras, radiusUsed, totalInRadius, centerName) {
+  resultsEl.innerHTML = '';
+  if (!cameras.length) {
+    resultsEl.innerHTML = '<p>No cameras found even after expanding radius. Try a different location in NYC.</p>';
+    return;
+  }
+  radiusInfoEl.style.display = 'block';
+  radiusInfoEl.innerHTML = `Showing ${cameras.length} cameras within ${radiusUsed} miles of <strong>${centerName}</strong> (${totalInRadius} total in radius). Images refresh ~every 15s.`;
+
+  cameras.forEach(cam => {
+    const card = document.createElement('div');
+    card.className = 'cam-card';
+    const img = document.createElement('img');
+    img.src = cam.imageUrl + '?t=' + Date.now();
+    img.alt = cam.name;
+    img.loading = 'lazy';
+    // Auto-refresh
+    setInterval(() => {
+      img.src = cam.imageUrl + '?t=' + Date.now();
+    }, 15000);
+
+    const info = document.createElement('div');
+    info.className = 'cam-info';
+    info.innerHTML = `
+      <div class="cam-name">${cam.name}</div>
+      <div class="cam-meta">
+        <span class="distance">${cam.distance.toFixed(2)} mi</span> · ${cam.area || 'NYC'}
+      </div>
+    `;
+    card.appendChild(img);
+    card.appendChild(info);
+    resultsEl.appendChild(card);
+  });
+}
+
+async function search(lat, lon, name) {
+  try {
+    statusEl.textContent = 'Searching...';
+    resultsEl.innerHTML = '';
+    radiusInfoEl.style.display = 'none';
+    await loadCameras();
+    currentCenter = { lat, lon, name };
+    const { cameras, radiusUsed, totalInRadius } = findNearby(lat, lon);
+    statusEl.textContent = '';
+    renderCameras(cameras, radiusUsed, totalInRadius, name);
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
+document.getElementById('searchBtn').addEventListener('click', async () => {
+  const q = addressInput.value.trim();
+  if (!q) return;
+  statusEl.textContent = 'Geocoding address...';
+  try {
+    const geo = await geocode(q);
+    await search(geo.lat, geo.lon, geo.name.split(',')[0]);
+  } catch (err) {
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+});
+
+document.getElementById('locateBtn').addEventListener('click', () => {
+  if (!navigator.geolocation) {
+    statusEl.textContent = 'Geolocation not supported';
+    return;
+  }
+  statusEl.textContent = 'Getting your location...';
+  navigator.geolocation.getCurrentPosition(
+    async pos => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      // Reverse geocode roughly or just use coords
+      await search(lat, lon, 'Your Location');
+    },
+    err => { statusEl.textContent = 'Location error: ' + err.message; }
+  );
+});
+
+// Initial load on page
+addressInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('searchBtn').click();
+});
+</script>
+</body>
+</html>
